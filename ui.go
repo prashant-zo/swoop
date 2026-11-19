@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -47,8 +50,7 @@ func rgb(r, g, b int) string {
 	if trueColor {
 		return fmt.Sprintf("\x1b[38;2;%d;%d;%dm", r, g, b)
 	}
-	// nearest color in the xterm 256-color 6x6x6 cube
-	q := func(v int) int { return (v*5 + 127) / 255 }
+	q := func(v int) int { return (v*5 + 127) / 255 } // nearest step in the 6x6x6 color cube
 	return fmt.Sprintf("\x1b[38;5;%dm", 16+36*q(r)+6*q(g)+q(b))
 }
 
@@ -86,7 +88,7 @@ var bannerRows = []string{
 	"╚══════╝ ╚══╝╚══╝  ╚═════╝  ╚═════╝ ╚═╝     ",
 }
 
-func printBanner(opts Options) {
+func printBanner(opts Options, st *Store) {
 	fmt.Println()
 	if termWidth() >= 50 {
 		for _, row := range bannerRows {
@@ -94,9 +96,8 @@ func printBanner(opts Options) {
 			var b strings.Builder
 			b.WriteString("  ")
 			for i, r := range runes {
-				t := float64(i) / float64(len(runes)-1) // violet -> cyan gradient
-				col := rgb(int(190-100*t), int(120+90*t), 255)
-				b.WriteString(c(col, string(r)))
+				t := float64(i) / float64(len(runes)-1) // violet -> cyan
+				b.WriteString(c(rgb(int(190-100*t), int(120+90*t), 255), string(r)))
 			}
 			fmt.Println(b.String())
 		}
@@ -104,25 +105,167 @@ func printBanner(opts Options) {
 		fmt.Println("  " + c(boldClr+accent, "swoop"))
 	}
 	fmt.Println()
-	fmt.Println("  " + c(boldClr, "IDM-style multi-connection downloads") + c(dimClr, "  ·  v"+version))
-	fmt.Println("  " + c(dimClr, fmt.Sprintf("saving to %s  ·  %d connections  ·  forced HTTP/1.1 streams", tildify(opts.Dir), opts.Conns)))
-	fmt.Println("  " + c(dimClr, "paste a link + Enter  ·  open  ·  help  ·  q to quit  ·  Ctrl+C pauses a download"))
+	fmt.Println("  " + c(boldClr, "fast downloads, right in your terminal") + c(dimClr, "   v"+version))
+	fmt.Println("  " + c(dimClr, fmt.Sprintf("saves to %s  ·  up to %d connections per file", tildify(opts.Dir), opts.Conns)))
+	fmt.Println("  " + c(dimClr, "paste a link and press Enter  ·  type ") + c(boldClr, "help") + c(dimClr, " anytime"))
+	if n := st.unfinished(); n > 0 {
+		word := "download"
+		if n > 1 {
+			word += "s"
+		}
+		fmt.Println("  " + c(warnClr, fmt.Sprintf("■ %d unfinished %s", n, word)) + c(dimClr, "  ·  type ") + c(boldClr, "list") + c(dimClr, " to continue"))
+	}
 	fmt.Println()
 }
 
 func printHelp() {
-	fmt.Println(c(dimClr, `
-  paste one or more links (space separated) and press Enter
-  Enter on an empty line   grab the link sitting in your clipboard
-  open                     open the download folder
-  q / quit                 exit
-  Ctrl+C                   pause the current download (paste the same link to resume)
-
-  from the shell: swoop -c 32 -o ~/Movies URL   ·   swoop -H "Cookie: a=b" URL
-`))
+	h := func(s string) string { return c(boldClr, s) }
+	d := func(s string) string { return c(dimClr, s) }
+	row := func(keys, desc string) {
+		pad := 14 - vlen(keys)
+		if pad < 1 {
+			pad = 1
+		}
+		fmt.Println("    " + c(boldClr+accent, keys) + strings.Repeat(" ", pad) + desc)
+	}
+	fmt.Println()
+	fmt.Println("  " + h("Download something"))
+	fmt.Println("    Paste a link and press " + c(boldClr+accent, "Enter") + ". That's it.")
+	fmt.Println("    " + d("Works with normal download links, magnet links and .torrent files."))
+	fmt.Println("    " + d("You can also drag a .torrent file into this window."))
+	fmt.Println("    " + d("Just copied a link? Press Enter on an empty line to use it."))
+	fmt.Println()
+	fmt.Println("  " + h("While it downloads"))
+	row("p", "pause it, you can continue later")
+	row("x", "cancel it and delete the unfinished file "+d("(press x twice)"))
+	row("Ctrl+C", "pause it")
+	fmt.Println()
+	fmt.Println("  " + h("Your downloads"))
+	row("list", "see everything you downloaded, continue paused ones,")
+	fmt.Println("                  open them, or clean up old ones")
+	fmt.Println("                  " + d("in the list:  ↑ ↓ choose · Enter continue or open · o show in folder"))
+	fmt.Println("                  " + d("              d remove from list · x delete the file too · Esc back"))
+	fmt.Println()
+	fmt.Println("  " + h("Settings for this session"))
+	row("folder PATH", "save new downloads somewhere else, like "+d("folder ~/Movies"))
+	row("open", "open the download folder")
+	fmt.Println()
+	fmt.Println("  " + h("Leave"))
+	row("q", "quit "+d("(paused downloads stay in your list)"))
+	fmt.Println()
 }
 
-// ---- live panel ----
+// ---- live view ----
+
+// job is anything swoop can show progress for: a file, a torrent, a stream.
+type job struct {
+	title   func() string
+	started time.Time
+	resumed int64
+	segmap  bool              // draw the per-connection map
+	info    func(Snap) string // the dim stats line
+	snap    func() Snap
+	done    <-chan error
+	stop    func() // stop now; whatever was downloaded stays on disk
+}
+
+type outcome int
+
+const (
+	finished outcome = iota
+	paused
+	cancelled
+	failed
+)
+
+// watch draws a job until it ends, and handles p / x / Ctrl+C.
+func watch(j *job, tty bool) (outcome, error) {
+	setCurrent(j.stop)
+	defer setCurrent(nil)
+	r := &renderer{}
+	every := 100 * time.Millisecond
+	if !tty {
+		every = 2 * time.Second
+	}
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	if tty {
+		fmt.Print(hideCursor)
+		defer fmt.Print(showCursor)
+	}
+	want := outcome(-1)
+	confirmX := false
+	for {
+		select {
+		case err := <-j.done:
+			if tty {
+				r.erase()
+			}
+			drainKeys()
+			switch {
+			case want == paused || want == cancelled:
+				return want, nil
+			case err == nil:
+				return finished, nil
+			case errors.Is(err, context.Canceled):
+				return paused, nil
+			default:
+				return failed, err
+			}
+		case <-tick.C:
+			if rawKeys && want < 0 {
+				for _, k := range takeKeys() {
+					isRune := func(rs ...rune) bool {
+						for _, x := range rs {
+							if k.name == "rune" && k.r == x {
+								return true
+							}
+						}
+						return false
+					}
+					switch {
+					case k.name == "ctrl-c" || isRune('p', 'P', ' '):
+						want = paused
+					case isRune('x', 'X'):
+						if confirmX {
+							want = cancelled
+						}
+						confirmX = true
+					default:
+						confirmX = false
+					}
+					if want >= 0 {
+						j.stop()
+						break
+					}
+				}
+			}
+			sn := j.snap()
+			r.update(sn)
+			if tty {
+				r.draw(j, sn, footer(want, confirmX))
+			} else if sn.Size > 0 {
+				fmt.Printf("  %5.1f%%  %s / %s  %s/s\n", float64(sn.Done)*100/float64(sn.Size),
+					fmtBytes(sn.Done), fmtBytes(sn.Size), fmtBytes(int64(r.speed)))
+			}
+		}
+	}
+}
+
+func footer(want outcome, confirmX bool) string {
+	switch {
+	case !rawKeys:
+		return c(dimClr, "  Ctrl+C pause")
+	case want == paused:
+		return c(warnClr, "  pausing…")
+	case want == cancelled:
+		return c(warnClr, "  cancelling…")
+	case confirmX:
+		return c(warnClr, "  press x again to cancel and delete what's downloaded so far") + c(dimClr, " · any other key keeps going")
+	}
+	k := func(s string) string { return c(boldClr, s) }
+	return "  " + k("p") + c(dimClr, " pause   ") + k("x") + c(dimClr, " cancel   ") + k("Ctrl+C") + c(dimClr, " pause")
+}
 
 type renderer struct {
 	lines   int
@@ -146,7 +289,7 @@ func (r *renderer) update(sn Snap) {
 	if r.samples == 0 {
 		r.speed = inst
 	} else {
-		r.speed = 0.3*inst + 0.7*r.speed // EWMA so the number does not jump around
+		r.speed = 0.3*inst + 0.7*r.speed // smoothed so the number doesn't jump around
 	}
 	r.samples++
 	r.lastT, r.lastB = now, sn.Written
@@ -166,8 +309,9 @@ func (r *renderer) erase() {
 	}
 }
 
-func (r *renderer) draw(d *Download, sn Snap) {
-	lines := r.panel(d, sn)
+func (r *renderer) draw(j *job, sn Snap, foot string) {
+	lines := r.panel(j, sn)
+	lines = append(lines, foot)
 	var b strings.Builder
 	if r.lines > 0 {
 		fmt.Fprintf(&b, "\x1b[%dF\x1b[J", r.lines)
@@ -180,20 +324,23 @@ func (r *renderer) draw(d *Download, sn Snap) {
 	os.Stdout.WriteString(b.String())
 }
 
-func (r *renderer) panel(d *Download, sn Snap) []string {
-	W := termWidth()
-	if W > 84 {
-		W = 84
+func panelWidth() int {
+	w := termWidth()
+	if w > 84 {
+		w = 84
 	}
-	if W < 40 {
-		W = 40
+	if w < 40 {
+		w = 40
 	}
+	return w
+}
+
+func (r *renderer) panel(j *job, sn Snap) []string {
+	W := panelWidth()
 	iw := W - 4
-	title := " " + truncate(d.Name, iw-6) + " "
+	title := " " + truncate(j.title(), iw-6) + " "
 	row := func(s string) string { return c(dimClr, "│ ") + padTo(s, iw) + c(dimClr, " │") }
-	out := []string{
-		c(dimClr, "╭─") + c(boldClr, title) + c(dimClr, strings.Repeat("─", W-3-vlen(title))+"╮"),
-	}
+	out := []string{c(dimClr, "╭─") + c(boldClr, title) + c(dimClr, strings.Repeat("─", W-3-vlen(title))+"╮")}
 
 	speed := fmtBytes(int64(r.speed)) + "/s"
 	if r.samples == 0 {
@@ -205,18 +352,19 @@ func (r *renderer) panel(d *Download, sn Snap) []string {
 		out = append(out, row(fmt.Sprintf("%s / %s   %s   ETA %s",
 			fmtBytes(sn.Done), fmtBytes(sn.Size), c(boldClr+accent, "↓ "+speed), r.eta(sn))))
 	} else {
-		out = append(out, row(fmt.Sprintf("%s downloaded (size unknown)   %s", fmtBytes(sn.Done), c(boldClr+accent, "↓ "+speed))))
+		out = append(out, row(fmt.Sprintf("%s so far   %s", fmtBytes(sn.Done), c(boldClr+accent, "↓ "+speed))))
 	}
-	info := fmt.Sprintf("%d conns · %d splits · %d retries · %s elapsed",
-		sn.Active, sn.Steals, sn.Retries, fmtDur(time.Since(d.Started)))
-	if d.Resumed > 0 {
-		info += " · resumed at " + fmtBytes(d.Resumed)
+	var info string
+	if j.info != nil {
+		info = j.info(sn)
+	} else {
+		info = fmt.Sprintf("%d connections · %d splits · %d retries · %s", sn.Active, sn.Steals, sn.Retries, fmtDur(time.Since(j.started)))
+		if j.resumed > 0 {
+			info += " · continued from " + fmtBytes(j.resumed)
+		}
 	}
-	if !d.Ranges {
-		info = "single stream (server has no range support) · " + fmtDur(time.Since(d.Started)) + " elapsed"
-	}
-	out = append(out, row(c(dimClr, info)))
-	if sn.Size > 0 {
+	out = append(out, row(c(dimClr, truncate(info, iw))))
+	if j.segmap && sn.Size > 0 {
 		out = append(out, row(""))
 		cells := segMap(sn, iw*2)
 		out = append(out, row(strings.Join(cells[:iw], "")), row(strings.Join(cells[iw:], "")))
@@ -235,14 +383,13 @@ func segMap(sn Snap, cells int) []string {
 		glyph := c(okClr, "█") // not covered by any piece = finished in an earlier run
 		for _, s := range sn.Segs {
 			if mid >= s.start && mid < s.end {
-				switch {
-				case mid < s.pos:
+				if mid < s.pos {
 					col := okClr
 					if s.color >= 0 {
 						col = palette[s.color%len(palette)]
 					}
 					glyph = c(col, "█")
-				default:
+				} else {
 					glyph = c(dimClr, "░")
 				}
 				break
@@ -277,98 +424,216 @@ func bar(frac float64, w int) string {
 	return c(accent, s) + c(dimClr, strings.Repeat("░", w-full))
 }
 
-// ---- one download, start to finish ----
+// ---- plain-file downloads ----
 
-func runOne(parent context.Context, rawURL string, opts Options, tty bool) error {
-	ctx, cancel := context.WithCancel(parent)
+func startLine(name, size, mode, extra string) {
+	max := termWidth() - 34
+	if max < 20 {
+		max = 20
+	}
+	line := fmt.Sprintf("  %s %s · %s · %s", c(accent, "↳"), c(boldClr, truncate(name, max)), size, mode)
+	if extra != "" {
+		line += extra
+	}
+	fmt.Println(line)
+}
+
+// downloadHTTP shows the live view for a prepared download.
+func downloadHTTP(d *Download, tty bool, label string) (outcome, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	setCurrent(cancel)
-	defer setCurrent(nil)
+	d.Started = time.Now()
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+	title := d.Name
+	if label != "" {
+		title = label + " · " + d.Name
+	}
+	j := &job{
+		title:   func() string { return title },
+		started: d.Started,
+		resumed: d.Resumed,
+		segmap:  d.Ranges,
+		snap:    d.Snapshot,
+		done:    done,
+		stop:    cancel,
+	}
+	if !d.Ranges {
+		j.info = func(Snap) string {
+			return "one connection (this server doesn't allow split downloads) · " + fmtDur(time.Since(d.Started))
+		}
+	}
+	return watch(j, tty)
+}
 
-	if tty {
-		fmt.Print(c(dimClr, "  connecting…"))
-	}
-	d, err := Probe(ctx, rawURL, opts)
-	if tty {
-		fmt.Print("\r\x1b[2K")
-	}
-	if err != nil {
-		fmt.Println(c(errClr, "  ✗ ") + "could not start: " + err.Error())
-		return err
-	}
+func runFile(d *Download, opts Options, tty bool, st *Store) error {
 	if err := d.Prepare(); err != nil {
-		fmt.Println(c(errClr, "  ✗ ") + err.Error())
+		fail("couldn't create the file: " + err.Error())
 		return err
 	}
 	mode := fmt.Sprintf("%d connections", d.Workers())
 	if !d.Ranges {
-		mode = c(warnClr, "single stream: server does not allow split downloads")
+		mode = c(warnClr, "1 connection")
 	}
-	size := "unknown size"
+	size := "size unknown"
 	if d.Size > 0 {
 		size = fmtBytes(d.Size)
 	}
-	line := fmt.Sprintf("  %s %s · %s · %s", c(accent, "↳"), c(boldClr, d.Name), size, mode)
+	extra := ""
 	if d.Resumed > 0 {
-		line += c(okClr, fmt.Sprintf(" · resuming, %s already done", fmtBytes(d.Resumed)))
+		extra = c(okClr, fmt.Sprintf(" · continuing, %s already done", fmtBytes(d.Resumed)))
 	}
-	fmt.Println(line)
+	startLine(d.Name, size, mode, extra)
+	e := st.track(&Entry{Kind: "file", URL: d.URL, Name: d.Name, Path: d.Path, Dir: opts.Dir, Size: d.Size})
 
-	done := make(chan error, 1)
-	go func() { done <- d.Run(ctx) }()
-
-	r := &renderer{}
-	every := 100 * time.Millisecond
-	if !tty {
-		every = 2 * time.Second
-	}
-	tick := time.NewTicker(every)
-	defer tick.Stop()
-	if tty {
-		fmt.Print(hideCursor)
-		defer fmt.Print(showCursor)
-	}
-	for {
-		select {
-		case err := <-done:
-			if tty {
-				r.erase()
-			}
-			report(d, err)
-			return err
-		case <-tick.C:
-			sn := d.Snapshot()
-			r.update(sn)
-			if tty {
-				r.draw(d, sn)
-			} else if sn.Size > 0 {
-				fmt.Printf("  %5.1f%%  %s / %s  %s/s\n", float64(sn.Done)*100/float64(sn.Size),
-					fmtBytes(sn.Done), fmtBytes(sn.Size), fmtBytes(int64(r.speed)))
-			}
+	out, err := downloadHTTP(d, tty, "")
+	sn := d.Snapshot()
+	switch out {
+	case finished:
+		st.finish(e, "done", d.Size)
+		el := d.Finished.Sub(d.Started)
+		avg := float64(d.written.Load()) / el.Seconds()
+		fmt.Printf("  %s %s  %s in %s · avg %s/s\n", c(okClr, "✓"), c(boldClr, truncate(d.Name, termWidth()-40)),
+			fmtBytes(d.Size), fmtDur(el), fmtBytes(int64(avg)))
+		fmt.Println("    " + c(dimClr, "→ "+tildify(d.Path)))
+	case paused:
+		st.finish(e, "paused", sn.Done)
+		reportPaused(d.Name, sn.Done, sn.Size, d.Ranges)
+	case cancelled:
+		os.Remove(d.Part)
+		os.Remove(d.Part + ".json")
+		st.remove(e)
+		fmt.Printf("  %s %s  cancelled, unfinished file deleted\n", c(dimClr, "✗"), c(boldClr, truncate(d.Name, termWidth()-40)))
+	case failed:
+		st.finish(e, "failed", sn.Done)
+		fmt.Printf("  %s %s  %s\n", c(errClr, "✗"), c(boldClr, truncate(d.Name, termWidth()-40)), friendlyErr(err))
+		if d.Ranges && exists(d.Part) {
+			fmt.Println("    " + c(dimClr, "what's downloaded is kept, type list to try again later"))
 		}
+	}
+	return outcomeErr(out, err)
+}
+
+func reportPaused(name string, done, size int64, canResume bool) {
+	msg := "stopped"
+	if canResume && size > 0 {
+		msg = fmt.Sprintf("paused at %.0f%%", float64(done)*100/float64(size))
+	}
+	fmt.Printf("  %s %s  %s%s\n", c(warnClr, "■"), c(boldClr, truncate(name, termWidth()-50)), msg,
+		c(dimClr, " · type list to continue it later"))
+}
+
+func fail(msg string) { fmt.Println("  " + c(errClr, "✗ ") + msg) }
+
+// debugf prints details only when SWOOP_DEBUG=1, for reporting problems.
+func debugf(format string, a ...any) {
+	if os.Getenv("SWOOP_DEBUG") != "" {
+		fmt.Println("  " + c(dimClr, "[debug] "+fmt.Sprintf(format, a...)))
 	}
 }
 
-func report(d *Download, err error) {
-	el := d.Finished.Sub(d.Started)
+// friendlyErr turns network errors into sentences a non-programmer can act on.
+func friendlyErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	debugf("%v", err)
+	var se *statusErr
+	var dnsErr *net.DNSError
+	var nerr net.Error
+	var opErr *net.OpError
 	switch {
-	case err == nil:
-		avg := float64(d.written.Load()) / el.Seconds()
-		fmt.Printf("  %s %s  %s in %s · avg %s/s · %d splits\n", c(okClr, "✓"), c(boldClr, d.Name),
-			fmtBytes(d.Size), fmtDur(el), fmtBytes(int64(avg)), d.steals.Load())
-		fmt.Println("    " + c(dimClr, "→ "+tildify(d.Path)))
-	case errors.Is(err, context.Canceled):
-		sn := d.Snapshot()
-		msg := "stopped"
-		if d.Ranges && sn.Size > 0 {
-			msg = fmt.Sprintf("paused at %.1f%%, paste the same link again to resume", float64(sn.Done)*100/float64(sn.Size))
+	case errors.As(err, &se):
+		switch {
+		case se.code == 401 || se.code == 403:
+			return fmt.Sprintf("the server refused access (%d). The link may have expired or needs a login.", se.code)
+		case se.code == 404 || se.code == 410:
+			return fmt.Sprintf("the file isn't there (%d). Check the link.", se.code)
+		case se.code == 429:
+			return "the server says too many requests. Wait a little and try again."
+		case se.code >= 500:
+			return fmt.Sprintf("the server is having problems (%d). Try again later.", se.code)
 		}
-		fmt.Printf("  %s %s  %s\n", c(warnClr, "■"), c(boldClr, d.Name), msg)
-	default:
-		fmt.Printf("  %s %s  %s\n", c(errClr, "✗"), c(boldClr, d.Name), err.Error())
-		if d.Ranges && exists(d.Part) {
-			fmt.Println("    " + c(dimClr, "partial file kept, paste the same link again to resume"))
+		return "the server said " + se.text
+	case errors.As(err, &dnsErr):
+		return "can't find that website. Check the link and your internet connection."
+	case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+		return "the server closed the connection without sending anything. It may be busy, try again later."
+	case errors.As(err, &nerr) && nerr.Timeout():
+		return "the server didn't answer. It may be down, or blocked on your network."
+	case errors.As(err, &opErr) && opErr.Op == "dial":
+		return "couldn't connect to the server. It may be down, or blocked on your network."
+	case strings.Contains(err.Error(), "x509") || strings.Contains(err.Error(), "tls:"):
+		return "the secure connection failed (certificate problem)."
+	}
+	return err.Error()
+}
+
+// ---- menus ----
+
+// pick shows a numbered menu and returns the chosen index, or -1 for Esc.
+func pick(question string, items []string) int {
+	if len(items) == 0 {
+		return -1
+	}
+	if !rawKeys {
+		fmt.Println("    " + question)
+		for i, it := range items {
+			fmt.Printf("      %d  %s\n", i+1, it)
 		}
+		line, ok := promptLine("    number ❯ ")
+		if !ok {
+			return -1
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || n < 1 || n > len(items) {
+			return -1
+		}
+		return n - 1
+	}
+	sel := 0
+	lines := 0
+	draw := func() {
+		var b strings.Builder
+		if lines > 0 {
+			fmt.Fprintf(&b, "\x1b[%dF\x1b[J", lines)
+		}
+		b.WriteString("    " + question + c(dimClr, "  (↑ ↓ then Enter, or press a number · Esc cancels)") + "\n")
+		for i, it := range items {
+			if i == sel {
+				fmt.Fprintf(&b, "    %s %s  %s\n", c(boldClr+accent, "❯"), c(boldClr, strconv.Itoa(i+1)), c(boldClr, it))
+			} else {
+				fmt.Fprintf(&b, "      %s  %s\n", c(dimClr, strconv.Itoa(i+1)), it)
+			}
+		}
+		lines = len(items) + 1
+		os.Stdout.WriteString(b.String())
+	}
+	fmt.Print(hideCursor)
+	defer fmt.Print(showCursor)
+	draw()
+	for {
+		k, ok := nextKey()
+		if !ok {
+			return -1
+		}
+		switch {
+		case k.name == "up":
+			sel = (sel + len(items) - 1) % len(items)
+		case k.name == "down" || k.name == "tab":
+			sel = (sel + 1) % len(items)
+		case k.name == "enter":
+			return sel
+		case k.name == "esc" || k.name == "ctrl-c" || (k.name == "rune" && k.r == 'q'):
+			return -1
+		case k.name == "rune" && k.r >= '1' && k.r <= '9':
+			if n := int(k.r - '1'); n < len(items) {
+				sel = n
+				draw()
+				return sel
+			}
+		}
+		draw()
 	}
 }
 

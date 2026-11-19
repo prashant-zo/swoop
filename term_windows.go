@@ -88,3 +88,40 @@ func readClipboard() string {
 }
 
 func openDir(dir string) error { return exec.Command("explorer", dir).Start() }
+
+// revealFile opens Explorer with the file selected.
+func revealFile(path string) error { return exec.Command("explorer", "/select,", path).Start() }
+
+var (
+	savedInMode uint32
+	haveInMode  bool
+)
+
+// setRaw switches the console keyboard to key-by-key mode, with arrow keys
+// arriving as escape sequences and Ctrl+C arriving as a key.
+func setRaw() bool {
+	const (
+		processedInput = 0x0001
+		lineInput      = 0x0002
+		echoInput      = 0x0004
+		vtInput        = 0x0200
+	)
+	h := uintptr(syscall.Stdin)
+	var mode uint32
+	if r, _, _ := procGetConsoleMode.Call(h, uintptr(unsafe.Pointer(&mode))); r == 0 {
+		return false
+	}
+	if !haveInMode {
+		savedInMode, haveInMode = mode, true
+	}
+	raw := (savedInMode &^ (processedInput | lineInput | echoInput)) | vtInput
+	r, _, _ := procSetConsoleMode.Call(h, uintptr(raw))
+	return r != 0
+}
+
+// setCooked puts the console keyboard back the way we found it.
+func setCooked() {
+	if haveInMode {
+		procSetConsoleMode.Call(uintptr(syscall.Stdin), uintptr(savedInMode))
+	}
+}

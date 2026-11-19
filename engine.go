@@ -44,10 +44,13 @@ type seg struct {
 }
 
 type Options struct {
-	Conns   int
-	Dir     string
-	Headers http.Header
-	NoSteal bool // benchmarking only: static split like basic downloaders
+	Conns     int
+	Dir       string
+	Headers   http.Header
+	Name      string // save under this name instead of the server's
+	ResumeKey string // identity for resume when the URL changes between runs
+	ChunkSize int64  // max bytes per request, for servers that refuse big ones
+	NoSteal   bool   // benchmarking only: static split like basic downloaders
 }
 
 type Download struct {
@@ -58,6 +61,7 @@ type Download struct {
 	Part     string
 	Size     int64 // -1 when the server does not say
 	ETag     string
+	CType    string // Content-Type of the first response
 	LastMod  string
 	Ranges   bool
 	Resumed  int64
@@ -125,6 +129,29 @@ func (d *Download) newReq(ctx context.Context, u string) (*http.Request, error) 
 // Probe asks for the first byte only. GET with Range works on servers and
 // CDNs that reject HEAD (S3 presigned URLs, many file hosts).
 func Probe(ctx context.Context, rawURL string, opts Options) (*Download, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		d, err := probeOnce(ctx, rawURL, opts)
+		if err == nil {
+			return d, nil
+		}
+		lastErr = err
+		var se *statusErr
+		if errors.As(err, &se) || ctx.Err() != nil {
+			break // the server answered clearly, asking again won't change it
+		}
+	}
+	return nil, lastErr
+}
+
+func probeOnce(ctx context.Context, rawURL string, opts Options) (*Download, error) {
 	d := &Download{URL: rawURL, opts: opts, client: newClient(), Size: -1}
 	req, err := d.newReq(ctx, rawURL)
 	if err != nil {
@@ -137,9 +164,10 @@ func Probe(ctx context.Context, rawURL string, opts Options) (*Download, error) 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("server said %s", resp.Status)
+		return nil, &statusErr{resp.StatusCode, resp.Status}
 	}
 	d.FinalURL = resp.Request.URL.String()
+	d.CType = resp.Header.Get("Content-Type")
 	d.ETag = resp.Header.Get("ETag")
 	d.LastMod = resp.Header.Get("Last-Modified")
 	switch resp.StatusCode {
@@ -151,7 +179,22 @@ func Probe(ctx context.Context, rawURL string, opts Options) (*Download, error) 
 		d.Size = resp.ContentLength
 	}
 	d.Name = pickName(resp, d.FinalURL)
+	if opts.Name != "" {
+		d.Name = sanitize(opts.Name)
+	}
 	return d, nil
+}
+
+// IsPage reports whether the link opened a web page instead of a file.
+func (d *Download) IsPage() bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(d.CType)), "text/html")
+}
+
+func (d *Download) resumeKey() string {
+	if d.opts.ResumeKey != "" {
+		return d.opts.ResumeKey
+	}
+	return d.URL
 }
 
 // Prepare picks the output file. If a matching .part + state file exists,
@@ -165,7 +208,7 @@ func (d *Download) Prepare() error {
 		final := filepath.Join(d.opts.Dir, name)
 		part := final + ".part"
 		if d.Ranges {
-			if st, ok := loadState(part + ".json"); ok && st.URL == d.URL && st.Size == d.Size && st.ETag == d.ETag && exists(part) {
+			if st, ok := loadState(part + ".json"); ok && st.URL == d.resumeKey() && st.Size == d.Size && st.ETag == d.ETag && exists(part) {
 				d.Name, d.Path, d.Part = name, final, part
 				var pending int64
 				for _, r := range st.Segs {
@@ -229,7 +272,9 @@ func (d *Download) Run(parent context.Context) error {
 	ctx, cancel := context.WithCancel(parent)
 	d.cancel = cancel
 	defer cancel()
-	d.Started = time.Now()
+	if d.Started.IsZero() {
+		d.Started = time.Now()
+	}
 
 	var err error
 	if d.Ranges {
@@ -333,7 +378,7 @@ func (d *Download) runParallel(ctx context.Context) error {
 		}
 		d.errMu.Lock()
 		defer d.errMu.Unlock()
-		return fmt.Errorf("incomplete after retries: %v", d.lastErr)
+		return fmt.Errorf("incomplete after retries: %w", d.lastErr)
 	}
 	return nil
 }
@@ -364,8 +409,11 @@ func (d *Download) worker(ctx context.Context, id int) {
 		d.retries.Add(1)
 		d.setErr(err)
 		var se *statusErr
-		tooMany := errors.As(err, &se) && (se.code == 429 || se.code == 503)
-		if errors.Is(err, errNoRange) || attempts > maxRetries || (tooMany && d.active.Load() > 0) {
+		isStatus := errors.As(err, &se)
+		tooMany := isStatus && (se.code == 429 || se.code == 503)
+		// a refusal like 403 or 404 rarely fixes itself, so give up sooner
+		refused := isStatus && se.code >= 400 && se.code < 500 && se.code != 408 && se.code != 429 && attempts >= 2
+		if errors.Is(err, errNoRange) || attempts > maxRetries || refused || (tooMany && d.active.Load() > 0) {
 			// Server limits connections (or this one keeps failing): hand the
 			// piece back so a healthy connection can take it, and retire.
 			d.release(s)
@@ -381,7 +429,7 @@ func (d *Download) worker(ctx context.Context, id int) {
 }
 
 // claim gives a worker its next piece: an unowned one first, otherwise it
-// steals the second half of the biggest remaining piece (IDM-style dynamic
+// steals the second half of the biggest remaining piece (dynamic
 // segmentation, so the end of the download does not crawl on one socket).
 func (d *Download) claim(id int) *seg {
 	d.mu.Lock()
@@ -427,13 +475,25 @@ func (d *Download) fetch(ctx context.Context, s *seg, buf []byte) (bool, error) 
 	if pos >= end {
 		return false, nil
 	}
+	// Some servers refuse big requests, so a piece may be fetched as several
+	// smaller requests one after another on the same connection.
+	stop := end
+	if c := d.opts.ChunkSize; c > 0 && stop-pos > c {
+		stop = pos + c
+	}
+	limit := func() int64 {
+		if e := s.end.Load(); e < stop {
+			return e
+		}
+		return stop
+	}
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	req, err := d.newReq(cctx, d.FinalURL)
 	if err != nil {
 		return false, err
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", pos, end-1))
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", pos, stop-1))
 	d.active.Add(1)
 	defer d.active.Add(-1)
 	resp, err := d.client.Do(req)
@@ -463,7 +523,7 @@ func (d *Download) fetch(ctx context.Context, s *seg, buf []byte) (bool, error) 
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			watchdog.Reset(stallTimeout)
-			p, e := s.pos.Load(), s.end.Load()
+			p, e := s.pos.Load(), limit()
 			if int64(n) > e-p {
 				n = int(e - p)
 			}
@@ -476,13 +536,18 @@ func (d *Download) fetch(ctx context.Context, s *seg, buf []byte) (bool, error) 
 				d.written.Add(int64(n))
 				progressed = true
 			}
-			if s.pos.Load() >= s.end.Load() {
-				return progressed, nil // done, or the rest was stolen
+			if s.pos.Load() >= limit() {
+				if s.pos.Load() < s.end.Load() {
+					// this chunk is done but the piece goes on: read to the end of
+					// the response so the connection can be reused for the next one
+					io.Copy(io.Discard, io.LimitReader(resp.Body, 1))
+				}
+				return progressed, nil // done, chunk done, or the rest was stolen
 			}
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
-				if s.pos.Load() >= s.end.Load() {
+				if s.pos.Load() >= limit() {
 					return progressed, nil
 				}
 				return progressed, io.ErrUnexpectedEOF
@@ -615,7 +680,7 @@ type state struct {
 }
 
 func (d *Download) saveState() {
-	st := state{URL: d.URL, Size: d.Size, ETag: d.ETag, LastMod: d.LastMod}
+	st := state{URL: d.resumeKey(), Size: d.Size, ETag: d.ETag, LastMod: d.LastMod}
 	d.mu.Lock()
 	for _, s := range d.segs {
 		if p, e := s.pos.Load(), s.end.Load(); p < e {

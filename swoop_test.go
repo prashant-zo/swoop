@@ -153,13 +153,13 @@ func fmtInt(n int64) string {
 }
 
 func TestPanelLinesHaveEqualWidth(t *testing.T) {
-	d := &Download{Name: "ubuntu-24.04-desktop-amd64.iso", Size: 100 << 20, Ranges: true, Started: time.Now()}
-	sn := Snap{Size: d.Size, Done: 40 << 20, Written: 40 << 20, Active: 3, Segs: []segView{
+	j := &job{title: func() string { return "ubuntu-24.04-desktop-amd64.iso" }, started: time.Now(), segmap: true}
+	sn := Snap{Size: 100 << 20, Done: 40 << 20, Written: 40 << 20, Active: 3, Segs: []segView{
 		{start: 0, pos: 30 << 20, end: 50 << 20, color: 0, active: true},
 		{start: 50 << 20, pos: 60 << 20, end: 100 << 20, color: 1, active: true},
 	}}
 	r := &renderer{speed: 5 << 20, samples: 3}
-	lines := r.panel(d, sn)
+	lines := r.panel(j, sn)
 	w := vlen(lines[0])
 	for i, l := range lines {
 		if vlen(l) != w {
