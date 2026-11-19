@@ -161,6 +161,8 @@ Same file, 8 connections, with one in four connections running 8x slower:
 
 swoop is inspired by Internet Download Manager (IDM) and the way it splits downloads across many connections. It's a separate project, built from scratch for the terminal.
 
+AI was used to help write the code.
+
 ## Release
 
 ```sh
