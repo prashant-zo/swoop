@@ -1,0 +1,5 @@
+/swoop
+/dist/
+*.part
+*.part.json
+.DS_Store
